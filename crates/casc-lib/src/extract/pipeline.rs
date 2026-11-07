@@ -164,13 +164,20 @@ impl CascStorage {
                 hash: hex::encode(ckey),
             })?;
 
-        let ekey = &enc_entry.ekeys[0];
-        let idx_entry = self
-            .index
-            .find(ekey)
+        // A content key can have several encodings, and a local install holds only some of
+        // them: read the first one the index has.
+        let idx_entry = enc_entry
+            .ekeys
+            .iter()
+            .find_map(|ekey| self.index.find(ekey))
             .ok_or_else(|| CascError::KeyNotFound {
                 key_type: "EKey".into(),
-                hash: hex::encode(ekey),
+                hash: enc_entry
+                    .ekeys
+                    .iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>()
+                    .join(","),
             })?;
 
         let blte_data = self.data.read_entry(

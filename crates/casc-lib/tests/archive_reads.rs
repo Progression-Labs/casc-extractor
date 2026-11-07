@@ -38,12 +38,14 @@ impl Drop for ArchiveDirectory {
     }
 }
 
-fn encoding_file(ckey: &[u8; 16], ekey: &[u8; 16], file_size: u64) -> EncodingFile {
+fn encoding_file(ckey: &[u8; 16], ekeys: &[[u8; 16]], file_size: u64) -> EncodingFile {
     let mut page = vec![0; 1024];
-    page[0] = 1; // One EKey for this CKey.
+    page[0] = ekeys.len() as u8; // EKeys for this CKey.
     page[1..6].copy_from_slice(&file_size.to_be_bytes()[3..]);
     page[6..22].copy_from_slice(ckey);
-    page[22..38].copy_from_slice(ekey);
+    for (i, ekey) in ekeys.iter().enumerate() {
+        page[22 + 16 * i..38 + 16 * i].copy_from_slice(ekey);
+    }
 
     let mut data = Vec::new();
     data.extend_from_slice(b"EN");
@@ -62,6 +64,16 @@ fn encoding_file(ckey: &[u8; 16], ekey: &[u8; 16], file_size: u64) -> EncodingFi
 
 #[test]
 fn read_by_ckey_decodes_entry_after_archive_header_at_indexed_offset() {
+    read_through_archive(&[]);
+}
+
+#[test]
+fn read_by_ckey_reads_the_encoding_the_install_holds() {
+    // The first encoding of this content is not in the local index; the second is.
+    read_through_archive(&[[0x5a; 16]]);
+}
+
+fn read_through_archive(missing_ekeys: &[[u8; 16]]) {
     let directory = ArchiveDirectory::new();
     let expected = b"archive payload\0with binary bytes\xff\x80\n";
     let ckey: [u8; 16] = Md5::digest(expected).into();
@@ -107,7 +119,11 @@ fn read_by_ckey_decodes_entry_after_archive_header_at_indexed_offset() {
             build_config: parse_build_config("").unwrap(),
             index: CascIndex::load(&directory.0).unwrap(),
             data: DataStore::open(&directory.0).unwrap(),
-            encoding: encoding_file(&ckey, &ekey, expected.len() as u64),
+            encoding: encoding_file(
+                &ckey,
+                &[missing_ekeys, &[ekey]].concat(),
+                expected.len() as u64,
+            ),
             root: RootFile::parse(&[0; 12]).unwrap(),
             listfile: Listfile::parse(""),
             keystore: TactKeyStore::new(),

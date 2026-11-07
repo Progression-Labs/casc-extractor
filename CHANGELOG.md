@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Strip CASC archive entry headers before decoding files read by content key or FileDataID.
+- Read the first encoding of a content key that the local index holds, not only the first one listed.
 
 ### Miscellaneous
 
