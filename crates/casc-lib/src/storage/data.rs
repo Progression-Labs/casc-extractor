@@ -100,8 +100,16 @@ impl DataStore {
     }
 
     /// Read the BLTE payload for an entry (skips the 30-byte data header).
+    ///
+    /// An entry can also start at its BLTE payload, its header left zeroed in the 30 bytes
+    /// before the indexed offset: the Classic Era install's newer archives (data.136 of a
+    /// shared retail/Classic Era `Data/`, 1.15.9) are written so. Such an entry is returned
+    /// whole, from the offset.
     pub fn read_entry(&self, archive_number: u32, offset: u64, size: u32) -> Result<&[u8]> {
         let raw = self.read_raw(archive_number, offset, size)?;
+        if raw.starts_with(b"BLTE") {
+            return Ok(raw);
+        }
         if raw.len() < DATA_HEADER_SIZE {
             return Err(CascError::InvalidFormat(
                 "data entry too small to contain header".into(),
@@ -174,5 +182,28 @@ mod tests {
     fn data_header_too_short() {
         let header = [0u8; 10];
         assert!(parse_data_header(&header).is_err());
+    }
+
+    /// An entry with its header and one indexed at its BLTE payload (the zeroed header before
+    /// it, as Classic Era's archives hold them) both read back as the payload.
+    #[test]
+    fn an_entry_indexed_at_its_payload_reads_whole() {
+        let dir = std::env::temp_dir().join(format!("casc-data-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blte = b"BLTE\0\0\0\0Npayload";
+        let mut bytes = vec![0u8; 30];
+        bytes[0x10..0x14].copy_from_slice(&(30 + blte.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(blte);
+        // the second entry: a zeroed header, then the payload the index points at
+        bytes.extend_from_slice(&[0u8; 30]);
+        let second = bytes.len() as u64;
+        bytes.extend_from_slice(blte);
+        std::fs::write(dir.join("data.000"), &bytes).unwrap();
+        let store = DataStore::open(&dir).unwrap();
+        let with_header = store.read_entry(0, 0, 30 + blte.len() as u32).unwrap();
+        let at_payload = store.read_entry(0, second, blte.len() as u32).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(with_header, blte);
+        assert_eq!(at_payload, blte);
     }
 }
