@@ -5,7 +5,7 @@
 //! module for per-block decompression and decryption. Supports both single-block
 //! (header size = 0) and multi-block layouts.
 
-use super::compression::decode_block_with_keys;
+use super::compression::{decode_block_at, decode_block_with_keys};
 use crate::blte::encryption::TactKeyStore;
 use crate::error::{CascError, Result};
 use crate::util::io::{read_be_u24, read_be_u32};
@@ -94,14 +94,21 @@ pub fn decode_blte_with_keys(data: &[u8], keystore: Option<&TactKeyStore>) -> Re
     // Decode blocks sequentially
     let mut data_pos = header_size as usize;
     let mut output = Vec::new();
-    for chunk in &chunks {
+    for (frame_index, chunk) in chunks.iter().enumerate() {
         let block_end = data_pos + chunk.compressed_size as usize;
         if data.len() < block_end {
             return Err(CascError::InvalidFormat("BLTE block data truncated".into()));
         }
         let block = &data[data_pos..block_end];
-        let decoded = decode_block_with_keys(block, keystore)?;
-        output.extend_from_slice(&decoded);
+        match decode_block_at(block, keystore, frame_index as u32) {
+            Ok(decoded) => output.extend_from_slice(&decoded),
+            // A frame whose key is unknown (content not released yet) reads as zeros of its
+            // size, as other CASC readers do, so the rest of the file still decodes.
+            Err(CascError::EncryptionKeyMissing(_)) => {
+                output.resize(output.len() + chunk.decompressed_size as usize, 0);
+            }
+            Err(e) => return Err(e),
+        }
         data_pos = block_end;
     }
 
@@ -285,10 +292,9 @@ mod tests {
         data.extend_from_slice(b"BLTE");
         data.extend_from_slice(&0u32.to_be_bytes()); // single block
         data.push(b'E'); // encrypted
-        data.push(1u8); // key_count
         data.push(8u8); // key_name_size
         data.extend_from_slice(&0xDEADu64.to_le_bytes()); // unknown key
-        data.extend_from_slice(&4u32.to_le_bytes()); // iv_size
+        data.push(4u8); // iv_size
         data.extend_from_slice(&[0; 4]); // iv
         data.push(b'S'); // salsa20
         data.extend_from_slice(b"fake_encrypted_data");
@@ -312,26 +318,15 @@ mod tests {
         let plaintext = b"Ndecrypted!";
         let iv_bytes = [0x10, 0x20, 0x30, 0x40];
 
-        // Encrypt plaintext with Salsa20
+        // Encrypt plaintext with Salsa20 (frame 0)
         let mut encrypted_payload = plaintext.to_vec();
-        {
-            use salsa20::Salsa20;
-            use salsa20::cipher::{KeyIvInit, StreamCipher};
-            let mut full_key = [0u8; 32];
-            full_key[..16].copy_from_slice(key);
-            full_key[16..].copy_from_slice(key);
-            let mut nonce = [0u8; 8];
-            nonce[..4].copy_from_slice(&iv_bytes);
-            let mut cipher = Salsa20::new(&full_key.into(), &nonce.into());
-            cipher.apply_keystream(&mut encrypted_payload);
-        }
+        crate::blte::encryption::apply_salsa20(key, &iv_bytes, 0, &mut encrypted_payload);
 
         // Build E-mode encryption header
         let mut e_block = Vec::new();
-        e_block.push(1u8); // key_count
         e_block.push(8u8); // key_name_size
         e_block.extend_from_slice(&key_name.to_le_bytes());
-        e_block.extend_from_slice(&4u32.to_le_bytes()); // iv_size
+        e_block.push(4u8); // iv_size
         e_block.extend_from_slice(&iv_bytes);
         e_block.push(b'S'); // salsa20
         e_block.extend_from_slice(&encrypted_payload);
@@ -345,5 +340,73 @@ mod tests {
 
         let result = decode_blte_with_keys(&data, Some(&ks)).unwrap();
         assert_eq!(result, b"decrypted!");
+    }
+
+    /// A multi-block BLTE: each block is (stored bytes, decompressed size).
+    fn multi_block(blocks: &[(Vec<u8>, u32)]) -> Vec<u8> {
+        let header_size = 12 + blocks.len() * 24;
+        let mut data = b"BLTE".to_vec();
+        data.extend_from_slice(&(header_size as u32).to_be_bytes());
+        data.push(0x0F);
+        data.extend_from_slice(&(blocks.len() as u32).to_be_bytes()[1..]);
+        for (stored, size) in blocks {
+            data.extend_from_slice(&(stored.len() as u32).to_be_bytes());
+            data.extend_from_slice(&size.to_be_bytes());
+            data.extend_from_slice(&[0; 16]);
+        }
+        for (stored, _) in blocks {
+            data.extend_from_slice(stored);
+        }
+        data
+    }
+
+    fn encrypted_block(key_name: u64, key: &[u8; 16], frame_index: u32, inner: &[u8]) -> Vec<u8> {
+        let iv = [0x10, 0x20, 0x30, 0x40];
+        let mut payload = inner.to_vec();
+        crate::blte::encryption::apply_salsa20(key, &iv, frame_index, &mut payload);
+        let mut block = vec![b'E', 8];
+        block.extend_from_slice(&key_name.to_le_bytes());
+        block.push(4);
+        block.extend_from_slice(&iv);
+        block.push(b'S');
+        block.extend_from_slice(&payload);
+        block
+    }
+
+    #[test]
+    fn blte_encrypted_frames_use_their_index() {
+        let key_name: u64 = 0xFA505078126ACB3E;
+        let ks = TactKeyStore::with_known_keys();
+        let key = *ks.get(key_name).unwrap();
+        let data = multi_block(&[
+            (encrypted_block(key_name, &key, 0, b"Nfirst "), 5),
+            (encrypted_block(key_name, &key, 1, b"Nsecond "), 6),
+            (encrypted_block(key_name, &key, 2, b"Nthird"), 5),
+        ]);
+        assert_eq!(
+            decode_blte_with_keys(&data, Some(&ks)).unwrap(),
+            b"first second third"
+        );
+    }
+
+    #[test]
+    fn blte_frame_with_unknown_key_is_zeros_of_its_size() {
+        let known: u64 = 0xFA505078126ACB3E;
+        let ks = TactKeyStore::with_known_keys();
+        let key = *ks.get(known).unwrap();
+        let data = multi_block(&[
+            (b"Nhead".to_vec(), 4),
+            (encrypted_block(0xDEAD_BEEF, &[7; 16], 1, b"Nsecret!!"), 8),
+            (encrypted_block(known, &key, 2, b"Ntail"), 4),
+        ]);
+        let out = decode_blte_with_keys(&data, Some(&ks)).unwrap();
+        assert_eq!(&out[..4], b"head");
+        assert_eq!(&out[4..12], &[0u8; 8]);
+        assert_eq!(&out[12..], b"tail");
+        // No keystore at all reads the same way.
+        let out = decode_blte_with_keys(&data, None).unwrap();
+        assert_eq!(out.len(), 16);
+        assert_eq!(&out[..4], b"head");
+        assert_eq!(&out[4..], &[0u8; 12]);
     }
 }

@@ -20,6 +20,17 @@ use crate::error::{CascError, Result};
 /// the decryption key. Pass `None` if encryption support is not needed
 /// - encrypted blocks will return an error in that case.
 pub fn decode_block_with_keys(block: &[u8], keystore: Option<&TactKeyStore>) -> Result<Vec<u8>> {
+    decode_block_at(block, keystore, 0)
+}
+
+/// Decode a BLTE block that is frame `frame_index` of its stream.
+///
+/// The index only matters to encrypted blocks: it is mixed into the cipher's IV.
+pub fn decode_block_at(
+    block: &[u8],
+    keystore: Option<&TactKeyStore>,
+    frame_index: u32,
+) -> Result<Vec<u8>> {
     if block.is_empty() {
         return Ok(Vec::new());
     }
@@ -27,7 +38,7 @@ pub fn decode_block_with_keys(block: &[u8], keystore: Option<&TactKeyStore>) -> 
         b'N' => decode_raw(&block[1..]),
         b'Z' => decode_zlib(&block[1..]),
         b'4' => decode_lz4(&block[1..]),
-        b'E' => decode_encrypted(&block[1..], keystore),
+        b'E' => decode_encrypted(&block[1..], keystore, frame_index),
         b'F' => decode_frame(&block[1..], keystore),
         mode => Err(CascError::InvalidFormat(format!(
             "unknown BLTE mode: 0x{:02X}",
@@ -44,14 +55,18 @@ pub fn decode_block(block: &[u8]) -> Result<Vec<u8>> {
     decode_block_with_keys(block, None)
 }
 
-fn decode_encrypted(data: &[u8], keystore: Option<&TactKeyStore>) -> Result<Vec<u8>> {
+fn decode_encrypted(
+    data: &[u8],
+    keystore: Option<&TactKeyStore>,
+    frame_index: u32,
+) -> Result<Vec<u8>> {
     let keystore = keystore.ok_or_else(|| {
         CascError::EncryptionKeyMissing("no keystore provided for encrypted block".into())
     })?;
     // decrypt_encrypted_block returns decrypted data where the first byte is the inner mode
-    let decrypted = decrypt_encrypted_block(data, keystore)?;
+    let decrypted = decrypt_encrypted_block(data, keystore, frame_index)?;
     // Recursively decode the inner block (which starts with a mode byte: N, Z, 4, etc.)
-    decode_block_with_keys(&decrypted, Some(keystore))
+    decode_block_at(&decrypted, Some(keystore), frame_index)
 }
 
 fn decode_frame(data: &[u8], keystore: Option<&TactKeyStore>) -> Result<Vec<u8>> {
@@ -188,10 +203,9 @@ mod tests {
         use crate::blte::encryption::TactKeyStore;
         // Build a minimal encrypted block with a key that won't be in the store
         let mut block = vec![b'E'];
-        block.push(1u8); // key_count
         block.push(8u8); // key_name_size
         block.extend_from_slice(&0xDEADu64.to_le_bytes());
-        block.extend_from_slice(&4u32.to_le_bytes()); // iv_size
+        block.push(4u8); // iv_size
         block.extend_from_slice(&[0; 4]); // iv
         block.push(b'S'); // salsa20
         block.extend_from_slice(b"fake_encrypted_data");
@@ -215,24 +229,13 @@ mod tests {
 
         // Encrypt the plaintext with Salsa20
         let mut encrypted_payload = plaintext.to_vec();
-        {
-            use salsa20::Salsa20;
-            use salsa20::cipher::{KeyIvInit, StreamCipher};
-            let mut full_key = [0u8; 32];
-            full_key[..16].copy_from_slice(key);
-            full_key[16..].copy_from_slice(key);
-            let mut nonce = [0u8; 8];
-            nonce[..4].copy_from_slice(&iv_bytes);
-            let mut cipher = Salsa20::new(&full_key.into(), &nonce.into());
-            cipher.apply_keystream(&mut encrypted_payload);
-        }
+        crate::blte::encryption::apply_salsa20(key, &iv_bytes, 0, &mut encrypted_payload);
 
         // Build the full E-mode block: E + encryption header + encrypted payload
         let mut block = vec![b'E'];
-        block.push(1u8);
         block.push(8u8);
         block.extend_from_slice(&key_name.to_le_bytes());
-        block.extend_from_slice(&4u32.to_le_bytes());
+        block.push(4u8);
         block.extend_from_slice(&iv_bytes);
         block.push(b'S');
         block.extend_from_slice(&encrypted_payload);

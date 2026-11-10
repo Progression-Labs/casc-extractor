@@ -60,6 +60,22 @@ fn high_res_variant_when_installed() {
     assert!(flags.has(ContentFlags::HIGH_RES_TEXTURE));
 }
 
+#[test]
+#[ignore]
+fn light_db2_decodes_past_its_encrypted_frame() {
+    let s = storage!("wowf");
+    let data = s.read_by_fdid(1375579, LocaleFlags::EN_US).unwrap();
+    assert_eq!(data.len(), 28_306);
+    assert_eq!(&data[..4], b"WDC5");
+}
+
+#[test]
+#[ignore]
+fn map_db2_decodes() {
+    let s = storage!("wowf");
+    s.read_by_fdid(1349477, LocaleFlags::EN_US).unwrap();
+}
+
 fn every_listed_path_reads(product: &str, var: &str) {
     let Ok(list) = std::env::var(var) else {
         eprintln!("SKIPPED: {var} not set");

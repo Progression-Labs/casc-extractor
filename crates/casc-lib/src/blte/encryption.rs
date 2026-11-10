@@ -5,8 +5,9 @@
 //! an encryption header that names the key (a `u64` key name), provides an
 //! IV, and identifies the cipher:
 //!
-//! - **Salsa20** (`S`) - the 16-byte TACT key is doubled to 32 bytes and
-//!   used with an 8-byte nonce derived from the IV.
+//! - **Salsa20** (`S`) - Salsa20/20 with the 16-byte TACT key as a 128-bit key (the
+//!   `expand 16-byte k` setup), and an 8-byte nonce: the IV padded to 8 bytes, its low four
+//!   bytes XORed with the frame's index.
 //! - **ARC4** (`A`) - RC4 with the standard WoW 1024-byte keystream skip.
 //!
 //! Keys are stored in a [`TactKeyStore`](crate::blte::encryption::TactKeyStore) which can be populated from the
@@ -14,9 +15,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-
-use salsa20::Salsa20;
-use salsa20::cipher::{KeyIvInit, StreamCipher};
 
 use crate::error::{CascError, Result};
 
@@ -139,90 +137,46 @@ pub struct EncryptionHeader {
 
 /// Parse an encryption header from the data following the `E` mode byte.
 ///
+/// The layout is `u8 key_name_size (8)`, `key_name[8]` (u64 LE), `u8 iv_size`, `iv[iv_size]`,
+/// `u8 type` (`S` Salsa20, `A` ARC4), then the encrypted payload.
+///
 /// Returns the parsed header and a slice of the remaining encrypted payload.
 pub fn parse_encryption_header(data: &[u8]) -> Result<(EncryptionHeader, &[u8])> {
-    if data.is_empty() {
-        return Err(CascError::InvalidFormat(
-            "encryption header: empty data".into(),
-        ));
-    }
-
+    let truncated = |what: &str| CascError::InvalidFormat(format!("encryption header: {what}"));
     let mut pos = 0;
 
-    // key_count (u8)
-    let key_count = data[pos] as usize;
+    let key_name_size = *data.get(pos).ok_or_else(|| truncated("empty data"))? as usize;
     pos += 1;
-
-    if key_count == 0 {
-        return Err(CascError::InvalidFormat(
-            "encryption header: key_count is 0".into(),
-        ));
+    if key_name_size != 8 {
+        return Err(CascError::InvalidFormat(format!(
+            "encryption header: expected key_name_size 8, got {key_name_size}"
+        )));
     }
+    let key_name_bytes = data
+        .get(pos..pos + 8)
+        .ok_or_else(|| truncated("truncated key_name"))?;
+    let key_name = u64::from_le_bytes(key_name_bytes.try_into().expect("8 bytes"));
+    pos += 8;
 
-    // We only use the first key but must skip through all of them.
-    let mut key_name: u64 = 0;
-    for i in 0..key_count {
-        if pos >= data.len() {
-            return Err(CascError::InvalidFormat(
-                "encryption header: truncated key_name_size".into(),
-            ));
-        }
-        let key_name_size = data[pos] as usize;
-        pos += 1;
-
-        if pos + key_name_size > data.len() {
-            return Err(CascError::InvalidFormat(
-                "encryption header: truncated key_name".into(),
-            ));
-        }
-
-        if i == 0 {
-            if key_name_size != 8 {
-                return Err(CascError::InvalidFormat(format!(
-                    "encryption header: expected key_name_size 8, got {}",
-                    key_name_size
-                )));
-            }
-            key_name = u64::from_le_bytes(data[pos..pos + 8].try_into().map_err(|_| {
-                CascError::InvalidFormat("encryption header: failed to read key_name".into())
-            })?);
-        }
-        pos += key_name_size;
-    }
-
-    // IV size (u32 LE)
-    if pos + 4 > data.len() {
-        return Err(CascError::InvalidFormat(
-            "encryption header: truncated IV size".into(),
-        ));
-    }
-    let iv_size = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| {
-        CascError::InvalidFormat("encryption header: failed to read IV size".into())
-    })?) as usize;
-    pos += 4;
-
-    // IV bytes
-    if pos + iv_size > data.len() {
-        return Err(CascError::InvalidFormat(
-            "encryption header: truncated IV".into(),
-        ));
-    }
-    let iv = data[pos..pos + iv_size].to_vec();
+    let iv_size = *data
+        .get(pos)
+        .ok_or_else(|| truncated("truncated IV size"))? as usize;
+    pos += 1;
+    let iv = data
+        .get(pos..pos + iv_size)
+        .ok_or_else(|| truncated("truncated IV"))?
+        .to_vec();
     pos += iv_size;
 
-    // encryption_type (u8)
-    if pos >= data.len() {
-        return Err(CascError::InvalidFormat(
-            "encryption header: missing encryption type".into(),
-        ));
-    }
-    let algorithm = match data[pos] {
+    let algorithm = match data
+        .get(pos)
+        .ok_or_else(|| truncated("missing encryption type"))?
+    {
         b'S' => EncryptionAlgorithm::Salsa20,
         b'A' => EncryptionAlgorithm::ARC4,
         other => {
             return Err(CascError::InvalidFormat(format!(
-                "encryption header: unknown algorithm 0x{:02X}",
-                other
+                "encryption header: unknown algorithm 0x{other:02X}"
             )));
         }
     };
@@ -284,19 +238,69 @@ impl Arc4 {
 // Salsa20 decryption helper
 // ---------------------------------------------------------------------------
 
-fn decrypt_salsa20(key: &[u8; 16], iv: &[u8], data: &mut [u8]) {
-    // Salsa20 requires a 32-byte key; double the 16-byte TACT key.
-    let mut full_key = [0u8; 32];
-    full_key[..16].copy_from_slice(key);
-    full_key[16..].copy_from_slice(key);
+/// One Salsa20/20 keystream block for a 128-bit key (`expand 16-byte k`).
+fn salsa20_block(key: &[u8; 16], nonce: &[u8; 8], counter: u64) -> [u8; 64] {
+    let word = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("4 bytes"));
+    let input: [u32; 16] = [
+        0x6170_7865,
+        word(&key[0..4]),
+        word(&key[4..8]),
+        word(&key[8..12]),
+        word(&key[12..16]),
+        0x3120_646e,
+        word(&nonce[0..4]),
+        word(&nonce[4..8]),
+        counter as u32,
+        (counter >> 32) as u32,
+        0x7962_2d36,
+        word(&key[0..4]),
+        word(&key[4..8]),
+        word(&key[8..12]),
+        word(&key[12..16]),
+        0x6b20_6574,
+    ];
+    let mut x = input;
+    macro_rules! qr {
+        ($a:expr, $b:expr, $c:expr, $d:expr) => {
+            x[$b] ^= x[$a].wrapping_add(x[$d]).rotate_left(7);
+            x[$c] ^= x[$b].wrapping_add(x[$a]).rotate_left(9);
+            x[$d] ^= x[$c].wrapping_add(x[$b]).rotate_left(13);
+            x[$a] ^= x[$d].wrapping_add(x[$c]).rotate_left(18);
+        };
+    }
+    for _ in 0..10 {
+        qr!(0, 4, 8, 12);
+        qr!(5, 9, 13, 1);
+        qr!(10, 14, 2, 6);
+        qr!(15, 3, 7, 11);
+        qr!(0, 1, 2, 3);
+        qr!(5, 6, 7, 4);
+        qr!(10, 11, 8, 9);
+        qr!(15, 12, 13, 14);
+    }
+    let mut out = [0u8; 64];
+    for (i, (a, b)) in x.iter().zip(input.iter()).enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&a.wrapping_add(*b).to_le_bytes());
+    }
+    out
+}
 
-    // Pad IV to 8-byte nonce.
+/// Apply the Salsa20 keystream of a TACT key, IV and frame index to `data` (it encrypts and
+/// decrypts alike).
+pub fn apply_salsa20(key: &[u8; 16], iv: &[u8], frame_index: u32, data: &mut [u8]) {
+    // The IV padded to the 8-byte nonce, its low four bytes XORed with the frame index.
     let mut nonce = [0u8; 8];
     let copy_len = iv.len().min(8);
     nonce[..copy_len].copy_from_slice(&iv[..copy_len]);
-
-    let mut cipher = Salsa20::new(&full_key.into(), &nonce.into());
-    cipher.apply_keystream(data);
+    for (byte, index_byte) in nonce.iter_mut().zip(frame_index.to_le_bytes()) {
+        *byte ^= index_byte;
+    }
+    for (counter, chunk) in data.chunks_mut(64).enumerate() {
+        let stream = salsa20_block(key, &nonce, counter as u64);
+        for (byte, k) in chunk.iter_mut().zip(stream) {
+            *byte ^= k;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +311,9 @@ fn decrypt_salsa20(key: &[u8; 16], iv: &[u8], data: &mut [u8]) {
 ///
 /// `data` is everything after the `E` mode byte. Returns the decrypted
 /// payload whose first byte is the inner compression mode (N, Z, 4, etc.).
-pub fn decrypt_block(data: &[u8], keystore: &TactKeyStore) -> Result<Vec<u8>> {
+/// `frame_index` is the block's index in its BLTE stream (0 for a single block): it is mixed
+/// into the Salsa20 IV.
+pub fn decrypt_block(data: &[u8], keystore: &TactKeyStore, frame_index: u32) -> Result<Vec<u8>> {
     let (header, encrypted) = parse_encryption_header(data)?;
 
     let key = keystore
@@ -317,7 +323,7 @@ pub fn decrypt_block(data: &[u8], keystore: &TactKeyStore) -> Result<Vec<u8>> {
     let mut output = encrypted.to_vec();
     match header.algorithm {
         EncryptionAlgorithm::Salsa20 => {
-            decrypt_salsa20(key, &header.iv, &mut output);
+            apply_salsa20(key, &header.iv, frame_index, &mut output);
         }
         EncryptionAlgorithm::ARC4 => {
             let mut cipher = Arc4::new(key);
@@ -526,17 +532,36 @@ mod tests {
     // Encryption header parsing tests
     // -----------------------------------------------------------------------
 
+    /// Header bytes after the `E` mode byte of wowf `dbfilesclient/light.db2`, frame 2.
+    const REAL_HEADER: [u8; 15] = [
+        0x08, 0xa9, 0xb2, 0x6f, 0xb3, 0x0d, 0x67, 0xa4, 0x0d, 0x04, 0x90, 0xc9, 0x0e, 0x8a, 0x53,
+    ];
+
+    /// A header in the TACT layout: `key_name_size`, key name, `iv_size`, IV, type.
+    fn header_bytes(key_name: u64, iv: &[u8], kind: u8) -> Vec<u8> {
+        let mut data = vec![8u8];
+        data.extend_from_slice(&key_name.to_le_bytes());
+        data.push(iv.len() as u8);
+        data.extend_from_slice(iv);
+        data.push(kind);
+        data
+    }
+
+    #[test]
+    fn parse_encryption_header_real_sample() {
+        let mut data = REAL_HEADER.to_vec();
+        data.extend_from_slice(b"payload");
+        let (header, remaining) = parse_encryption_header(&data).unwrap();
+        assert_eq!(header.key_name, 0x0DA4_670D_B36F_B2A9);
+        assert_eq!(header.iv, vec![0x90, 0xc9, 0x0e, 0x8a]);
+        assert_eq!(header.algorithm, EncryptionAlgorithm::Salsa20);
+        assert_eq!(remaining, b"payload");
+    }
+
     #[test]
     fn parse_encryption_header_salsa20() {
-        let mut data = Vec::new();
-        data.push(1u8); // key_count = 1
-        data.push(8u8); // key_name_size = 8
-        data.extend_from_slice(&0xFA505078126ACB3Eu64.to_le_bytes());
-        data.extend_from_slice(&4u32.to_le_bytes()); // iv_size = 4
-        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // IV
-        data.push(b'S'); // Salsa20
+        let mut data = header_bytes(0xFA505078126ACB3E, &[1, 2, 3, 4], b'S');
         data.extend_from_slice(b"encrypted_payload");
-
         let (header, remaining) = parse_encryption_header(&data).unwrap();
         assert_eq!(header.key_name, 0xFA505078126ACB3E);
         assert_eq!(header.iv, vec![0x01, 0x02, 0x03, 0x04]);
@@ -546,15 +571,8 @@ mod tests {
 
     #[test]
     fn parse_encryption_header_arc4() {
-        let mut data = Vec::new();
-        data.push(1u8);
-        data.push(8u8);
-        data.extend_from_slice(&0xDEADBEEFu64.to_le_bytes());
-        data.extend_from_slice(&4u32.to_le_bytes());
-        data.extend_from_slice(&[0x0A, 0x0B, 0x0C, 0x0D]);
-        data.push(b'A'); // ARC4
+        let mut data = header_bytes(0xDEADBEEF, &[0x0A, 0x0B, 0x0C, 0x0D], b'A');
         data.extend_from_slice(b"payload");
-
         let (header, remaining) = parse_encryption_header(&data).unwrap();
         assert_eq!(header.algorithm, EncryptionAlgorithm::ARC4);
         assert_eq!(header.key_name, 0xDEADBEEF);
@@ -567,15 +585,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_encryption_header_unknown_algo_errors() {
-        let mut data = Vec::new();
-        data.push(1u8);
-        data.push(8u8);
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&4u32.to_le_bytes());
-        data.extend_from_slice(&[0; 4]);
-        data.push(b'X'); // unknown
+    fn parse_encryption_header_truncated_errors() {
+        for len in 0..REAL_HEADER.len() {
+            assert!(
+                parse_encryption_header(&REAL_HEADER[..len]).is_err(),
+                "{len} bytes"
+            );
+        }
+    }
 
+    #[test]
+    fn parse_encryption_header_unknown_algo_errors() {
+        assert!(parse_encryption_header(&header_bytes(0, &[0; 4], b'X')).is_err());
+    }
+
+    #[test]
+    fn parse_encryption_header_wrong_key_name_size_errors() {
+        let mut data = header_bytes(0, &[0; 4], b'S');
+        data[0] = 4;
         assert!(parse_encryption_header(&data).is_err());
     }
 
@@ -617,20 +644,47 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn salsa20_round_trip() {
+    fn salsa20_128_bit_key_matches_ecrypt_vector() {
+        // ECRYPT Salsa20/20 128-bit key, set 1 vector 0: key 80 00.., IV 0, first 64 bytes.
+        let mut key = [0u8; 16];
+        key[0] = 0x80;
+        let expected = hex::decode(
+            "4DFA5E481DA23EA09A31022050859936DA52FCEE218005164F267CB65F5CFD7F\
+             2B4F97E0FF16924A52DF269515110A07F9E460BC65EF95DA58F740B7D1DBB0AA",
+        )
+        .unwrap();
+        let mut data = [0u8; 64];
+        apply_salsa20(&key, &[0; 8], 0, &mut data);
+        assert_eq!(&data[..], &expected[..]);
+    }
+
+    #[test]
+    fn salsa20_round_trip_across_blocks() {
         let key = [0x42u8; 16];
         let iv = [0x01, 0x02, 0x03, 0x04];
-        let plaintext = b"test salsa20 encryption data";
+        let plaintext: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
 
-        // Encrypt
-        let mut data = plaintext.to_vec();
-        decrypt_salsa20(&key, &iv, &mut data);
-        assert_ne!(&data[..], &plaintext[..]);
+        let mut data = plaintext.clone();
+        apply_salsa20(&key, &iv, 0, &mut data);
+        assert_ne!(data, plaintext);
+        apply_salsa20(&key, &iv, 0, &mut data);
+        assert_eq!(data, plaintext);
+    }
 
-        // Decrypt (XOR is self-inverse with same keystream)
-        let mut roundtrip = data.clone();
-        decrypt_salsa20(&key, &iv, &mut roundtrip);
-        assert_eq!(&roundtrip[..], &plaintext[..]);
+    #[test]
+    fn salsa20_frame_index_changes_the_stream() {
+        let key = [0x42u8; 16];
+        let iv = [0x01, 0x02, 0x03, 0x04];
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        apply_salsa20(&key, &iv, 0, &mut a);
+        apply_salsa20(&key, &iv, 1, &mut b);
+        assert_ne!(a, b);
+
+        // Index 1 XORs the first IV byte with 1: the same as IV [0x00, 0x02, 0x03, 0x04] at 0.
+        let mut c = [0u8; 16];
+        apply_salsa20(&key, &[0x00, 0x02, 0x03, 0x04], 0, &mut c);
+        assert_eq!(b, c);
     }
 
     // -----------------------------------------------------------------------
@@ -640,16 +694,10 @@ mod tests {
     #[test]
     fn decrypt_block_missing_key_errors() {
         let ks = TactKeyStore::new(); // empty - no keys
-        let mut data = Vec::new();
-        data.push(1u8); // key_count
-        data.push(8u8); // key_name_size
-        data.extend_from_slice(&0xDEADBEEFu64.to_le_bytes());
-        data.extend_from_slice(&4u32.to_le_bytes());
-        data.extend_from_slice(&[0; 4]);
-        data.push(b'S');
+        let mut data = header_bytes(0xDEADBEEF, &[0; 4], b'S');
         data.extend_from_slice(b"encrypted");
 
-        let result = decrypt_block(&data, &ks);
+        let result = decrypt_block(&data, &ks, 0);
         assert!(result.is_err());
         match result.unwrap_err() {
             CascError::EncryptionKeyMissing(_) => {}
@@ -667,23 +715,16 @@ mod tests {
         let plaintext = b"Nhello world inner content";
         let iv_bytes = [0x10, 0x20, 0x30, 0x40];
 
-        // Encrypt the plaintext with Salsa20 to build a test encrypted payload
-        let mut encrypted_payload = plaintext.to_vec();
-        decrypt_salsa20(key, &iv_bytes, &mut encrypted_payload);
+        for frame_index in [0u32, 3] {
+            let mut encrypted_payload = plaintext.to_vec();
+            apply_salsa20(key, &iv_bytes, frame_index, &mut encrypted_payload);
 
-        // Build the full encrypted block (header + encrypted payload)
-        let mut block_data = Vec::new();
-        block_data.push(1u8);
-        block_data.push(8u8);
-        block_data.extend_from_slice(&key_name.to_le_bytes());
-        block_data.extend_from_slice(&4u32.to_le_bytes());
-        block_data.extend_from_slice(&iv_bytes);
-        block_data.push(b'S');
-        block_data.extend_from_slice(&encrypted_payload);
+            let mut block_data = header_bytes(key_name, &iv_bytes, b'S');
+            block_data.extend_from_slice(&encrypted_payload);
 
-        // Decrypt and verify we get the original plaintext back
-        let decrypted = decrypt_block(&block_data, &ks).unwrap();
-        assert_eq!(&decrypted[..], &plaintext[..]);
+            let decrypted = decrypt_block(&block_data, &ks, frame_index).unwrap();
+            assert_eq!(&decrypted[..], &plaintext[..]);
+        }
     }
 
     #[test]
@@ -694,22 +735,14 @@ mod tests {
 
         let plaintext = b"Zcompressed inner data here";
 
-        // Encrypt with ARC4
         let mut encrypted_payload = plaintext.to_vec();
         let mut cipher = Arc4::new(key);
         cipher.process(&mut encrypted_payload);
 
-        // Build header
-        let mut block_data = Vec::new();
-        block_data.push(1u8);
-        block_data.push(8u8);
-        block_data.extend_from_slice(&key_name.to_le_bytes());
-        block_data.extend_from_slice(&4u32.to_le_bytes());
-        block_data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
-        block_data.push(b'A');
+        let mut block_data = header_bytes(key_name, &[1, 2, 3, 4], b'A');
         block_data.extend_from_slice(&encrypted_payload);
 
-        let decrypted = decrypt_block(&block_data, &ks).unwrap();
+        let decrypted = decrypt_block(&block_data, &ks, 0).unwrap();
         assert_eq!(&decrypted[..], &plaintext[..]);
     }
 
