@@ -43,6 +43,22 @@ pub struct RootEntry {
     pub name_hash: Option<u64>,
 }
 
+/// The entries of one FileDataID in the order a reader should try them: the standard variant
+/// before the low-violence one, and within each the high-resolution variant before the
+/// standard one. Entries that tie keep their root order.
+pub fn order_variants<'a>(
+    candidates: impl IntoIterator<Item = &'a RootEntry>,
+) -> Vec<&'a RootEntry> {
+    let mut ordered: Vec<&RootEntry> = candidates.into_iter().collect();
+    ordered.sort_by_key(|e| {
+        (
+            e.content_flags.has(ContentFlags::LOW_VIOLENCE),
+            !e.content_flags.has(ContentFlags::HIGH_RES_TEXTURE),
+        )
+    });
+    ordered
+}
+
 /// Detected root file format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootFormat {
@@ -93,6 +109,22 @@ impl RootFile {
             .get(&fdid)?
             .iter()
             .find(|e| e.locale_flags.matches(locale))
+    }
+
+    /// Every entry for a FileDataID that matches the locale filter, in root order.
+    ///
+    /// A root can list several entries for one FileDataID and locale that differ by content
+    /// flag (a high-resolution texture, a low-violence variant), each with its own content key.
+    pub fn find_all_by_fdid(
+        &self,
+        fdid: u32,
+        locale: LocaleFlags,
+    ) -> impl Iterator<Item = &RootEntry> {
+        self.entries
+            .get(&fdid)
+            .into_iter()
+            .flatten()
+            .filter(move |e| e.locale_flags.matches(locale))
     }
 
     /// Iterate all (FileDataID, entry) pairs.
@@ -306,6 +338,26 @@ fn parse_block_header(
 mod tests {
     use super::*;
     use crate::root::flags::{ContentFlags, LocaleFlags};
+
+    #[test]
+    fn order_variants_prefers_standard_then_high_res() {
+        let entry = |tag: u8, flags: u32| RootEntry {
+            ckey: [tag; 16],
+            content_flags: ContentFlags(flags),
+            locale_flags: LocaleFlags::ALL,
+            name_hash: None,
+        };
+        let low_violence = entry(1, 0x80);
+        let low_violence_hires = entry(2, 0x80 | 0x1);
+        let standard = entry(3, 0);
+        let hires = entry(4, 0x1);
+        let order: Vec<u8> =
+            order_variants([&low_violence, &low_violence_hires, &standard, &hires])
+                .iter()
+                .map(|e| e.ckey[0])
+                .collect();
+        assert_eq!(order, vec![4, 3, 2, 1]);
+    }
 
     type RootBlockEntry = (i32, [u8; 16], Option<u64>);
 

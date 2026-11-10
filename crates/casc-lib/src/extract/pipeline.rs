@@ -19,8 +19,8 @@ use crate::encoding::parser::EncodingFile;
 use crate::error::{CascError, Result};
 use crate::listfile::downloader::load_or_download;
 use crate::listfile::parser::Listfile;
-use crate::root::flags::LocaleFlags;
-use crate::root::parser::{RootEntry, RootFile, RootFormat};
+use crate::root::flags::{ContentFlags, LocaleFlags};
+use crate::root::parser::{RootEntry, RootFile, RootFormat, order_variants};
 use crate::storage::data::DataStore;
 use crate::storage::index::CascIndex;
 
@@ -189,17 +189,45 @@ impl CascStorage {
         decode_blte_with_keys(blte_data, Some(&self.keystore))
     }
 
-    /// Read a file by FileDataID and locale.
-    pub fn read_by_fdid(&self, fdid: u32, locale: LocaleFlags) -> Result<Vec<u8>> {
-        let root_entry =
-            self.root
-                .find_by_fdid(fdid, locale)
-                .ok_or_else(|| CascError::KeyNotFound {
-                    key_type: "FDID".into(),
-                    hash: format!("{} (locale {})", fdid, locale),
-                })?;
+    /// Whether the local index holds any encoding of a content key.
+    fn holds_ckey(&self, ckey: &[u8; 16]) -> bool {
+        self.encoding
+            .find_ekey(ckey)
+            .is_some_and(|e| e.ekeys.iter().any(|ekey| self.index.find(ekey).is_some()))
+    }
 
-        self.read_by_ckey(&root_entry.ckey)
+    /// Read a file by FileDataID and locale.
+    ///
+    /// See [`read_by_fdid_with_flags`](Self::read_by_fdid_with_flags) for which variant is read.
+    pub fn read_by_fdid(&self, fdid: u32, locale: LocaleFlags) -> Result<Vec<u8>> {
+        self.read_by_fdid_with_flags(fdid, locale)
+            .map(|(data, _)| data)
+    }
+
+    /// Read a file by FileDataID and locale, and return the content flags of the variant read.
+    ///
+    /// The root can list several variants of one FileDataID and locale (high-resolution
+    /// texture, low violence), and an install holds only some of them. Every locale-matching
+    /// entry is considered: standard before low-violence, and within that the high-resolution
+    /// variant before the standard one. The first whose encoding the local index holds is read.
+    /// When none is local the error is `KeyNotFound` for the `EKey`s of the preferred variant.
+    pub fn read_by_fdid_with_flags(
+        &self,
+        fdid: u32,
+        locale: LocaleFlags,
+    ) -> Result<(Vec<u8>, ContentFlags)> {
+        let ordered = order_variants(self.root.find_all_by_fdid(fdid, locale));
+        let Some(first) = ordered.first() else {
+            return Err(CascError::KeyNotFound {
+                key_type: "FDID".into(),
+                hash: format!("{} (locale {})", fdid, locale),
+            });
+        };
+        let local = ordered.iter().find(|e| self.holds_ckey(&e.ckey));
+        // With no local variant, read_by_ckey of the preferred one reports the missing EKeys.
+        let chosen = local.unwrap_or(first);
+        let data = self.read_by_ckey(&chosen.ckey)?;
+        Ok((data, chosen.content_flags))
     }
 
     /// Return high-level statistics about the loaded storage.
